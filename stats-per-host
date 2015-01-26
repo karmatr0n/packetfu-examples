@@ -1,0 +1,91 @@
+#!/usr/bin/env ruby
+# -*- coding: binary -*-
+require 'packetfu'
+
+class StatsPerHost
+  def initialize(infile)
+    @pcap_file = infile
+    @stats = {}
+  end
+
+  def count_packets
+    count = 0
+    elapsed = 0
+    start_time = Time.now
+    PacketFu::PcapFile.read_packets(@pcap_file) do |pkt|
+      stats_by_daddr(pkt)
+      count += 1
+      elapsed = (Time.now - start_time).to_i
+      if count % 5_000 == 0
+        puts "After #{count} packets (#{elapsed}) seconds elapsed"
+      end
+    end
+  end
+
+  def stats_by_daddr(pkt)
+    kind = pkt.proto.last.to_sym
+    saddr, daddr = saddr_daddr(pkt, kind)
+    if @stats.has_key? daddr
+      if @stats[daddr].has_key? saddr
+        if @stats[daddr][saddr].has_key? saddr
+          @stats[daddr][saddr][kind] += 1
+        else
+          @stats[daddr][saddr][kind] = 1
+        end
+      else
+        @stats[daddr][saddr] = { kind => 1}
+      end
+    else
+      @stats[daddr] = { saddr => { kind => 1 } }
+    end
+  end
+
+  def saddr_daddr(pkt, kind)
+    case kind
+    when :ARP
+      return pkt.arp_saddr_ip, pkt.arp_daddr_ip
+    when :IPv6
+      return pkt.ipv6_saddr, pkt.ipv6_daddr
+    when :Invalid
+      return pkt.peek_format, ''
+    when :LLDP
+      return pkt.lldp_saddr_mac, "01:80:C2:00:00:0e"
+    else
+      return pkt.ip_saddr, pkt.ip_daddr
+    end
+  end
+
+  def print_results
+    @stats.each_pair do |host, results|
+      t = "Destination IP: #{host}\n"
+      puts t
+      puts "=" * t.length
+      stats_per_host results
+      puts ""
+    end
+  end
+
+  def stats_per_host(results)
+    columns = %w(SADDR TCP UDP IP ICMP ARP LLDP IPv6 Invalid)
+    format = "%-33s " + "%-4s " * (columns.size - 1) + "\n"
+    print format % columns
+    results.each_pair do |src_addr, stats|
+      values = columns.collect { |k| stats[k.to_sym] || 0 }
+      values.unshift(src_addr.slice(0,32))
+      print format % values
+    end
+  end
+end
+
+infile = ARGV[0] || 'in.pcap'
+if File.readable?(infile)
+  title = "Simple stats per destination host in #{infile}"
+  puts "-" * title.size
+  puts title
+  puts "-" * title.size
+  @stats = StatsPerHost.new(infile)
+  @stats.count_packets
+  @stats.print_results
+else
+  raise RuntimeError, "Need an infile, like so: #{$0} in.cap"
+end

